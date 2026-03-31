@@ -5,6 +5,14 @@ function normalizeSessionId(sessionId) {
   return String(sessionId || '').trim();
 }
 
+function normalizePriority(priority, fallback = 0) {
+  const normalized = Number(priority);
+  if (!Number.isFinite(normalized) || normalized < 0) {
+    return fallback;
+  }
+  return Math.floor(normalized);
+}
+
 function mapAccount(row) {
   return {
     id: row.id,
@@ -12,9 +20,97 @@ function mapAccount(row) {
     name: row.name || '',
     sessionId: row.session_id,
     isDefault: Boolean(row.is_default),
+    isEnabled: row.is_enabled !== undefined ? Boolean(row.is_enabled) : true,
+    priority: row.priority !== undefined ? Number(row.priority) || 0 : 0,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+}
+
+function maskSessionId(sessionId) {
+  const normalized = normalizeSessionId(sessionId);
+  if (!normalized) {
+    return '';
+  }
+  if (normalized.length <= 8) {
+    return normalized;
+  }
+  return `${normalized.slice(0, 4)}...${normalized.slice(-4)}`;
+}
+
+function getEnabledAccountRows(userId) {
+  const db = getDatabase();
+  return db.prepare(`
+    SELECT *
+    FROM jimeng_session_accounts
+    WHERE user_id = ? AND is_enabled = 1
+    ORDER BY priority ASC, id ASC
+  `).all(userId);
+}
+
+function rebalancePriorities(userId) {
+  const db = getDatabase();
+  const rows = db.prepare(`
+    SELECT id
+    FROM jimeng_session_accounts
+    WHERE user_id = ?
+    ORDER BY is_enabled DESC, priority ASC, is_default DESC, id ASC
+  `).all(userId);
+
+  const stmt = db.prepare(`
+    UPDATE jimeng_session_accounts
+    SET priority = ?,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = ? AND user_id = ?
+  `);
+
+  rows.forEach((row, index) => {
+    stmt.run(index, row.id, userId);
+  });
+}
+
+function ensureDefaultAccount(userId) {
+  const db = getDatabase();
+  const enabledDefault = db.prepare(`
+    SELECT id
+    FROM jimeng_session_accounts
+    WHERE user_id = ? AND is_enabled = 1
+    ORDER BY priority ASC, id ASC
+    LIMIT 1
+  `).get(userId);
+
+  const fallbackDefault = enabledDefault || db.prepare(`
+    SELECT id
+    FROM jimeng_session_accounts
+    WHERE user_id = ?
+    ORDER BY priority ASC, id ASC
+    LIMIT 1
+  `).get(userId);
+
+  db.prepare(`
+    UPDATE jimeng_session_accounts
+    SET is_default = 0,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE user_id = ?
+  `).run(userId);
+
+  if (fallbackDefault?.id) {
+    db.prepare(`
+      UPDATE jimeng_session_accounts
+      SET is_default = 1,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = ? AND user_id = ?
+    `).run(fallbackDefault.id, userId);
+  }
+}
+
+function syncAccountOrdering(userId) {
+  const db = getDatabase();
+  const transaction = db.transaction(() => {
+    rebalancePriorities(userId);
+    ensureDefaultAccount(userId);
+  });
+  transaction();
 }
 
 export function listUserAccounts(userId) {
@@ -23,10 +119,14 @@ export function listUserAccounts(userId) {
     SELECT *
     FROM jimeng_session_accounts
     WHERE user_id = ?
-    ORDER BY is_default DESC, id ASC
+    ORDER BY is_enabled DESC, priority ASC, id ASC
   `).all(userId);
 
   return rows.map(mapAccount);
+}
+
+export function listActiveAccounts(userId) {
+  return getEnabledAccountRows(userId).map(mapAccount);
 }
 
 export function createUserAccount(userId, payload) {
@@ -48,18 +148,37 @@ export function createUserAccount(userId, payload) {
   }
 
   const hasAny = db.prepare(`
-    SELECT id FROM jimeng_session_accounts
+    SELECT COUNT(*) AS count FROM jimeng_session_accounts
     WHERE user_id = ?
-    LIMIT 1
   `).get(userId);
 
-  const isDefault = hasAny ? 0 : 1;
+  const nextPriorityRow = db.prepare(`
+    SELECT COALESCE(MAX(priority), -1) + 1 AS nextPriority
+    FROM jimeng_session_accounts
+    WHERE user_id = ?
+  `).get(userId);
+
+  const isFirstAccount = !hasAny || Number(hasAny.count) === 0;
+  const isEnabled = payload.isEnabled === undefined ? 1 : (payload.isEnabled ? 1 : 0);
+  const priority = isFirstAccount
+    ? 0
+    : normalizePriority(payload.priority, Number(nextPriorityRow?.nextPriority) || 0);
+  const isDefault = isFirstAccount ? 1 : 0;
 
   const result = db.prepare(`
-    INSERT INTO jimeng_session_accounts (user_id, name, session_id, is_default, updated_at)
-    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-  `).run(userId, name, sessionId, isDefault);
+    INSERT INTO jimeng_session_accounts (
+      user_id,
+      name,
+      session_id,
+      is_default,
+      is_enabled,
+      priority,
+      updated_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+  `).run(userId, name, sessionId, isDefault, isEnabled, priority);
 
+  syncAccountOrdering(userId);
   return getUserAccountById(userId, Number(result.lastInsertRowid));
 }
 
@@ -86,6 +205,10 @@ export function updateUserAccount(userId, accountId, payload) {
   const nextSessionId = payload.sessionId !== undefined
     ? normalizeSessionId(payload.sessionId)
     : existing.sessionId;
+  const nextIsEnabled = payload.isEnabled !== undefined ? Boolean(payload.isEnabled) : existing.isEnabled;
+  const nextPriority = payload.priority !== undefined
+    ? normalizePriority(payload.priority, existing.priority)
+    : existing.priority;
 
   if (!nextSessionId) {
     throw new Error('SessionID 不能为空');
@@ -104,10 +227,13 @@ export function updateUserAccount(userId, accountId, payload) {
     UPDATE jimeng_session_accounts
     SET name = ?,
         session_id = ?,
+        is_enabled = ?,
+        priority = ?,
         updated_at = CURRENT_TIMESTAMP
     WHERE id = ? AND user_id = ?
-  `).run(nextName, nextSessionId, accountId, userId);
+  `).run(nextName, nextSessionId, nextIsEnabled ? 1 : 0, nextPriority, accountId, userId);
 
+  syncAccountOrdering(userId);
   return getUserAccountById(userId, accountId);
 }
 
@@ -130,9 +256,14 @@ export function setDefaultAccount(userId, accountId) {
     db.prepare(`
       UPDATE jimeng_session_accounts
       SET is_default = 1,
+          is_enabled = 1,
+          priority = 0,
           updated_at = CURRENT_TIMESTAMP
       WHERE id = ? AND user_id = ?
     `).run(accountId, userId);
+
+    rebalancePriorities(userId);
+    ensureDefaultAccount(userId);
   });
 
   transaction();
@@ -153,23 +284,8 @@ export function deleteUserAccount(userId, accountId) {
       WHERE id = ? AND user_id = ?
     `).run(accountId, userId);
 
-    if (existing.isDefault) {
-      const next = db.prepare(`
-        SELECT id FROM jimeng_session_accounts
-        WHERE user_id = ?
-        ORDER BY id ASC
-        LIMIT 1
-      `).get(userId);
-
-      if (next) {
-        db.prepare(`
-          UPDATE jimeng_session_accounts
-          SET is_default = 1,
-              updated_at = CURRENT_TIMESTAMP
-          WHERE id = ?
-        `).run(next.id);
-      }
-    }
+    rebalancePriorities(userId);
+    ensureDefaultAccount(userId);
   });
 
   transaction();
@@ -185,20 +301,15 @@ export async function testSessionId(sessionId) {
   return settingsService.testSessionId(normalized);
 }
 
-export function resolveEffectiveSession(userId) {
-  const db = getDatabase();
-  const userDefault = db.prepare(`
-    SELECT *
-    FROM jimeng_session_accounts
-    WHERE user_id = ? AND is_default = 1
-    LIMIT 1
-  `).get(userId);
-
-  if (userDefault?.session_id) {
+export function resolveEffectiveSessions(userId) {
+  const accounts = listActiveAccounts(userId);
+  if (accounts.length > 0) {
     return {
       source: 'user_default',
-      sessionId: userDefault.session_id,
-      account: mapAccount(userDefault),
+      sessionId: accounts[0].sessionId,
+      account: accounts[0],
+      accounts,
+      defaultAccount: accounts[0],
     };
   }
 
@@ -208,6 +319,18 @@ export function resolveEffectiveSession(userId) {
       source: 'legacy_global',
       sessionId: legacyGlobal,
       account: null,
+      accounts: [{
+        id: 0,
+        userId,
+        name: 'legacy_global',
+        sessionId: legacyGlobal,
+        isDefault: true,
+        isEnabled: true,
+        priority: 0,
+        createdAt: '',
+        updatedAt: '',
+      }],
+      defaultAccount: null,
     };
   }
 
@@ -217,6 +340,18 @@ export function resolveEffectiveSession(userId) {
       source: 'env_default',
       sessionId: envSessionId,
       account: null,
+      accounts: [{
+        id: -1,
+        userId,
+        name: 'env_default',
+        sessionId: envSessionId,
+        isDefault: true,
+        isEnabled: true,
+        priority: 0,
+        createdAt: '',
+        updatedAt: '',
+      }],
+      defaultAccount: null,
     };
   }
 
@@ -224,16 +359,44 @@ export function resolveEffectiveSession(userId) {
     source: 'none',
     sessionId: '',
     account: null,
+    accounts: [],
+    defaultAccount: null,
   };
+}
+
+export function resolveEffectiveSession(userId) {
+  const resolved = resolveEffectiveSessions(userId);
+  return {
+    source: resolved.source,
+    sessionId: resolved.sessionId,
+    account: resolved.account,
+  };
+}
+
+export function formatAccountInfo(account) {
+  if (!account) {
+    return null;
+  }
+
+  return JSON.stringify({
+    accountId: account.id ?? null,
+    name: account.name || '',
+    sessionId: maskSessionId(account.sessionId),
+    priority: account.priority ?? 0,
+    source: account.id > 0 ? 'user_account' : account.name || 'fallback',
+  });
 }
 
 export default {
   listUserAccounts,
+  listActiveAccounts,
   createUserAccount,
   getUserAccountById,
   updateUserAccount,
   setDefaultAccount,
   deleteUserAccount,
   testSessionId,
+  resolveEffectiveSessions,
   resolveEffectiveSession,
+  formatAccountInfo,
 };

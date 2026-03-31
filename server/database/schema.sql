@@ -155,6 +155,8 @@ CREATE TABLE IF NOT EXISTS jimeng_session_accounts (
   name TEXT DEFAULT '',
   session_id TEXT NOT NULL,
   is_default INTEGER DEFAULT 0,
+  is_enabled INTEGER DEFAULT 1,
+  priority INTEGER DEFAULT 0,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,

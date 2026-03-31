@@ -7,8 +7,95 @@ const JIMENG_BASE_URL = 'https://jimeng.jianying.com';
 const DEFAULT_ASSISTANT_ID = 513695;
 const VERSION_CODE = '8.4.0';
 const PLATFORM_CODE = '7';
-const WEB_ID = Math.random() * 999999999999999999 + 7000000000000000000;
-const USER_ID = crypto.randomUUID().replace(/-/g, '');
+const accountIdentityCache = new Map();
+
+function getAccountIdentity(sessionId) {
+  const cacheKey = String(sessionId || '').trim();
+  if (!cacheKey) {
+    return {
+      webId: Math.random() * 999999999999999999 + 7000000000000000000,
+      userId: crypto.randomUUID().replace(/-/g, ''),
+    };
+  }
+
+  const existing = accountIdentityCache.get(cacheKey);
+  if (existing) {
+    return existing;
+  }
+
+  const identity = {
+    webId: Math.random() * 999999999999999999 + 7000000000000000000,
+    userId: crypto.randomUUID().replace(/-/g, ''),
+  };
+  accountIdentityCache.set(cacheKey, identity);
+  return identity;
+}
+
+function buildSessionCookie(sessionId, webId, userId) {
+  return [
+    `_tea_web_id=${webId}`,
+    `is_staff_user=false`,
+    `store-region=cn-gd`,
+    `store-region-src=uid`,
+    `uid_tt=${userId}`,
+    `uid_tt_ss=${userId}`,
+    `sid_tt=${sessionId}`,
+    `sessionid=${sessionId}`,
+    `sessionid_ss=${sessionId}`,
+  ].join('; ');
+}
+
+function createJimengRequestContext(sessionId) {
+  const { webId, userId } = getAccountIdentity(sessionId);
+  return { sessionId, webId, userId };
+}
+
+function getSessionLogLabel(sessionId) {
+  const normalized = String(sessionId || '').trim();
+  if (!normalized) {
+    return 'empty';
+  }
+  return `${normalized.substring(0, 8)}...`;
+}
+
+function getRequestContext(options = {}) {
+  return options.requestContext || createJimengRequestContext(options.sessionId);
+}
+
+function buildGenerateHeaders(requestContext) {
+  return {
+    ...FAKE_HEADERS,
+    Cookie: buildSessionCookie(requestContext.sessionId, requestContext.webId, requestContext.userId),
+  };
+}
+
+function buildGenerateParams(requestContext, extraParams = {}) {
+  return {
+    aid: DEFAULT_ASSISTANT_ID,
+    device_platform: 'web',
+    region: 'cn',
+    webId: requestContext.webId,
+    da_version: '3.3.2',
+    web_component_open_flag: 1,
+    web_version: '7.5.0',
+    aigc_features: 'app_lip_sync',
+    ...extraParams,
+  };
+}
+
+function withRequestContext(options = {}, requestContext) {
+  return {
+    ...options,
+    requestContext,
+  };
+}
+
+function logRequestContext(action, requestContext) {
+  console.log(`[video] ${action} session: ${getSessionLogLabel(requestContext.sessionId)}, webId: ${String(requestContext.webId).slice(0, 10)}..., uid: ${requestContext.userId.slice(0, 8)}...`);
+}
+
+export { createJimengRequestContext };
+
 
 const FAKE_HEADERS = {
   Accept: 'application/json, text/plain, */*',
@@ -58,23 +145,6 @@ const VIDEO_RESOLUTION = {
   '9:16': { width: 720, height: 1280 },
   '21:9': { width: 1680, height: 720 },
 };
-
-/**
- * 生成 Cookie
- */
-function generateCookie(sessionId) {
-  return [
-    `_tea_web_id=${WEB_ID}`,
-    `is_staff_user=false`,
-    `store-region=cn-gd`,
-    `store-region-src=uid`,
-    `uid_tt=${USER_ID}`,
-    `uid_tt_ss=${USER_ID}`,
-    `sid_tt=${sessionId}`,
-    `sessionid=${sessionId}`,
-    `sessionid_ss=${sessionId}`,
-  ].join('; ');
-}
 
 /**
  * 生成签名
@@ -205,28 +275,18 @@ function createAWSSignature(
  * 即梦 API 请求
  */
 async function jimengRequest(method, uri, sessionId, options = {}) {
+  const requestContext = getRequestContext({ ...options, sessionId });
   const { deviceTime, sign } = generateSign(uri);
   const fullUrl = new URL(`${JIMENG_BASE_URL}${uri}`);
 
-  const defaultParams = {
-    aid: DEFAULT_ASSISTANT_ID,
-    device_platform: 'web',
-    region: 'cn',
-    webId: WEB_ID,
-    da_version: '3.3.2',
-    web_component_open_flag: 1,
-    web_version: '7.5.0',
-    aigc_features: 'app_lip_sync',
-    ...(options.params || {}),
-  };
+  const defaultParams = buildGenerateParams(requestContext, options.params || {});
 
   for (const [key, value] of Object.entries(defaultParams)) {
     fullUrl.searchParams.set(key, String(value));
   }
 
   const headers = {
-    ...FAKE_HEADERS,
-    Cookie: generateCookie(sessionId),
+    ...buildGenerateHeaders(requestContext),
     'Device-Time': String(deviceTime),
     Sign: sign,
     'Sign-Ver': '1',
@@ -279,14 +339,14 @@ async function jimengRequest(method, uri, sessionId, options = {}) {
 /**
  * 上传图片到 ImageX CDN
  */
-async function uploadImageBuffer(buffer, sessionId) {
+async function uploadImageBuffer(buffer, sessionId, requestContext = createJimengRequestContext(sessionId)) {
   console.log(`  [upload] 开始上传图片，大小：${buffer.length} 字节`);
 
   const tokenResult = await jimengRequest(
     'post',
     '/mweb/v1/get_upload_token',
     sessionId,
-    { data: { scene: 2 } }
+    withRequestContext({ data: { scene: 2 } }, requestContext)
   );
 
   const { access_key_id, secret_access_key, session_token, service_id } =
@@ -545,6 +605,7 @@ async function generateSeedanceVideo(options) {
     onVideoReady,
   } = options;
 
+  const requestContext = getRequestContext(options);
   const startTime = Date.now();
   const modelKey = model && MODEL_MAP[model] ? model : 'seedance-2.0';
   const modelId = MODEL_MAP[modelKey];
@@ -555,6 +616,7 @@ async function generateSeedanceVideo(options) {
   const { width, height } = resConfig;
 
   console.log(`[video] ${modelKey}: ${width}x${height} (${ratio}) ${actualDuration}秒`);
+  logRequestContext('本次生成绑定账号', requestContext);
 
   if (onProgress) onProgress('正在上传参考图片...');
 
@@ -565,7 +627,7 @@ async function generateSeedanceVideo(options) {
       `[video] 上传图片 ${i + 1}/${files.length}: ${files[i].originalname}`
     );
 
-    const imageUri = await uploadImageBuffer(files[i].buffer, sessionId);
+    const imageUri = await uploadImageBuffer(files[i].buffer, sessionId, requestContext);
     uploadedImages.push({ uri: imageUri, width, height });
   }
 
@@ -633,7 +695,7 @@ async function generateSeedanceVideo(options) {
     aid: String(DEFAULT_ASSISTANT_ID),
     device_platform: 'web',
     region: 'cn',
-    webId: String(WEB_ID),
+    webId: String(requestContext.webId),
     da_version: SEEDANCE_DRAFT_VERSION,
     web_component_open_flag: '1',
     web_version: '7.5.0',
@@ -730,8 +792,8 @@ async function generateSeedanceVideo(options) {
 
   const generateResult = await browserService.fetch(
     sessionId,
-    WEB_ID,
-    USER_ID,
+    requestContext.webId,
+    requestContext.userId,
     generateUrl,
     {
       method: 'POST',
@@ -743,14 +805,25 @@ async function generateSeedanceVideo(options) {
   if (generateResult.ret !== undefined && String(generateResult.ret) !== '0') {
     const retCode = String(generateResult.ret);
     const errMsg = generateResult.errmsg || retCode;
+    console.warn(
+      `[video] 提交被平台拒绝 session: ${getSessionLogLabel(sessionId)}, ret=${retCode}, errmsg=${errMsg}`
+    );
     if (retCode === '5000') throw new Error('即梦积分不足，请前往即梦官网领取积分');
     throw new Error(`即梦 API 错误 (ret=${retCode}): ${errMsg}`);
   }
 
   const aigcData = generateResult.data?.aigc_data;
   const historyId = aigcData?.history_record_id;
-  if (!historyId) throw new Error('未获取到记录 ID');
+  if (!historyId) {
+    console.warn(
+      `[video] 提交响应缺少 historyId session: ${getSessionLogLabel(sessionId)}`
+    );
+    throw new Error('未获取到记录 ID');
+  }
 
+  console.log(
+    `[video] 提交成功 session: ${getSessionLogLabel(sessionId)}, historyId: ${historyId}`
+  );
   console.log(`[video] 生成请求已提交，historyId: ${historyId}`);
   await invokePersistenceCallback(onHistoryId, 'onHistoryId', historyId);
 
@@ -768,7 +841,7 @@ async function generateSeedanceVideo(options) {
         'post',
         '/mweb/v1/get_history_by_ids',
         sessionId,
-        { data: { history_ids: [historyId] } }
+        withRequestContext({ data: { history_ids: [historyId] } }, requestContext)
       );
 
       const historyData = result?.history_list?.[0] || result?.[historyId];
@@ -842,13 +915,16 @@ async function generateSeedanceVideo(options) {
         'post',
         '/mweb/v1/get_local_item_list',
         sessionId,
-        {
-          data: {
-            item_id_list: [String(itemId)],
-            pack_item_opt: { scene: 1, need_data_integrity: true },
-            is_for_video_download: true,
+        withRequestContext(
+          {
+            data: {
+              item_id_list: [String(itemId)],
+              pack_item_opt: { scene: 1, need_data_integrity: true },
+              is_for_video_download: true,
+            },
           },
-        }
+          requestContext
+        )
       );
 
       const hqItemList = hqResult?.item_list || hqResult?.local_item_list || [];

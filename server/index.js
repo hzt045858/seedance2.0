@@ -168,9 +168,97 @@ const VIDEO_RESOLUTION = {
 // ============================================================
 const tasks = new Map();
 let taskCounter = 0;
+const accountCursors = new Map(); // userId -> lastUsedIndex
 
 function getMissingSessionErrorMessage() {
-  return '未配置可用的 SessionID，请在设置页添加并设为默认账号';
+  return '未配置可用的 SessionID，请在设置页添加并启用账号';
+}
+
+function isRetryableSessionError(error) {
+  const message = String(error?.message || error || '').toLowerCase();
+  if (!message) {
+    return false;
+  }
+
+  return [
+    'sessionid 无效',
+    'sessionid invalid',
+    '未登录',
+    'login',
+    '401',
+    '403',
+    'cookie',
+    '积分不足',
+    'credit',
+    'expired',
+    '过期',
+    '账号',
+    'session',
+    'timeout',
+    '超时',
+    'navigate',
+    'net::',
+    'err_connection',
+    'page.goto',
+    'fetch failed',
+    'econnrefused',
+    'econnreset',
+  ].some((keyword) => message.includes(keyword));
+}
+
+function rotateAccounts(accounts, userId) {
+  if (accounts.length <= 1) return accounts;
+
+  const nextIndex = accountCursors.get(userId) || 0;
+  const selectedAccount = accounts[nextIndex];
+  const reservedNextIndex = (nextIndex + 1) % accounts.length;
+  accountCursors.set(userId, reservedNextIndex);
+
+  console.log(`[account] 轮询选择账号: ${selectedAccount.name || `账号${nextIndex + 1}`} (session: ${selectedAccount.sessionId.substring(0, 8)}..., ${nextIndex + 1}/${accounts.length})`);
+  console.log(`[account] 已预留下次轮询起点: ${accounts[reservedNextIndex].name || `账号${reservedNextIndex + 1}`} (${reservedNextIndex + 1}/${accounts.length})`);
+
+  return [...accounts.slice(nextIndex), ...accounts.slice(0, nextIndex)];
+}
+
+function advanceAccountCursor(accounts, userId, account) {
+  if (!Array.isArray(accounts) || accounts.length <= 1 || !account) {
+    return;
+  }
+
+  const currentIndex = accounts.findIndex((item) => item.id === account.id);
+  if (currentIndex === -1) {
+    return;
+  }
+
+  const nextIndex = (currentIndex + 1) % accounts.length;
+  accountCursors.set(userId, nextIndex);
+  console.log(`[account] 本次成功账号: ${account.name || `账号${currentIndex + 1}`} (${currentIndex + 1}/${accounts.length})`);
+  console.log(`[account] 下次轮询起点: ${accounts[nextIndex].name || `账号${nextIndex + 1}`} (${nextIndex + 1}/${accounts.length})`);
+}
+
+async function runWithSessionAccounts(accounts, runner, userId) {
+  let lastError = null;
+
+  for (let index = 0; index < accounts.length; index += 1) {
+    const account = accounts[index];
+    try {
+      const result = await runner(account, index);
+      return { result, account };
+    } catch (error) {
+      lastError = error;
+      const remaining = accounts.length - index - 1;
+      if (remaining > 0 && isRetryableSessionError(error)) {
+        console.warn(
+          `[account] 账号 ${account.name || `账号${index + 1}`} (session: ${account.sessionId.substring(0, 8)}...) 执行失败: ${error.message}`
+        );
+        console.warn(`[account] 切换到下一个账号 (剩余 ${remaining} 个)`);
+      } else {
+        throw error;
+      }
+    }
+  }
+
+  throw lastError || new Error(getMissingSessionErrorMessage());
 }
 
 function ensureDefaultProjectForUser(userId) {
@@ -852,8 +940,8 @@ app.post('/api/generate-video', authenticate, upload.array('files', 5), async (r
     const { prompt, ratio, duration, model } = req.body;
     const files = req.files;
 
-    const resolvedSession = jimengSessionService.resolveEffectiveSession(req.user.id);
-    if (!resolvedSession.sessionId) {
+    const resolvedSessions = jimengSessionService.resolveEffectiveSessions(req.user.id);
+    if (!resolvedSessions.sessionId || resolvedSessions.accounts.length === 0) {
       return res.status(401).json({ error: getMissingSessionErrorMessage() });
     }
 
@@ -896,7 +984,7 @@ app.post('/api/generate-video', authenticate, upload.array('files', 5), async (r
     console.log(`  prompt: ${(prompt || '').substring(0, 80)}${(prompt || '').length > 80 ? '...' : ''}`);
     console.log(`  model: ${model || 'seedance-2.0'}, ratio: ${ratio || '4:3'}, duration: ${duration || 4}秒`);
     console.log(`  files: ${files.length}张`);
-    console.log(`  session source: ${resolvedSession.source}`);
+    console.log(`  session source: ${resolvedSessions.source}`);
     files.forEach((f, i) => {
       console.log(
         `  file[${i}]: ${f.originalname} (${f.mimetype}, ${(f.size / 1024).toFixed(1)}KB)`
@@ -905,12 +993,27 @@ app.post('/api/generate-video', authenticate, upload.array('files', 5), async (r
 
     res.json({ taskId, dbTaskId });
 
-    generateSeedanceVideoCore({
+    const baseAccounts = resolvedSessions.accounts;
+    const rotatedAccounts = rotateAccounts(baseAccounts, req.user.id);
+    runWithSessionAccounts(rotatedAccounts, async (account, index) => {
+      if (index > 0) {
+        const switchMessage = `当前账号不可用，切换到下一个账号：${account.name || `账号${index + 1}`}`;
+        task.progress = switchMessage;
+        if (dbTaskId) {
+          try {
+            taskService.updateTask(dbTaskId, { progress: switchMessage });
+          } catch (dbError) {
+            console.error('[生成任务] 保存切换进度失败:', dbError.message);
+          }
+        }
+      }
+
+      return generateSeedanceVideoCore({
       prompt,
       ratio: ratio || '4:3',
       duration: parseInt(duration) || 4,
       files,
-      sessionId: resolvedSession.sessionId,
+      sessionId: account.sessionId,
       model: model || 'seedance-2.0',
       onProgress: async (progress) => {
         task.progress = progress;
@@ -929,6 +1032,7 @@ app.post('/api/generate-video', authenticate, upload.array('files', 5), async (r
             taskService.updateTask(dbTaskId, {
               submit_id: submitId,
               submitted_at: new Date().toISOString(),
+              account_info: jimengSessionService.formatAccountInfo(account),
             });
             console.log(`[生成任务] submitId 已保存到数据库：${submitId}`);
           } catch (dbError) {
@@ -942,6 +1046,7 @@ app.post('/api/generate-video', authenticate, upload.array('files', 5), async (r
             taskService.updateTask(dbTaskId, {
               history_id: historyId,
               status: 'generating',
+              account_info: jimengSessionService.formatAccountInfo(account),
             });
             console.log(`[生成任务] historyId 已保存到数据库：${historyId}`);
           } catch (dbError) {
@@ -968,8 +1073,10 @@ app.post('/api/generate-video', authenticate, upload.array('files', 5), async (r
           }
         }
       },
+    });
     })
-      .then((result) => {
+      .then(({ result, account }) => {
+        advanceAccountCursor(baseAccounts, req.user.id, account);
         task.status = 'done';
         task.result = {
           created: Math.floor(Date.now() / 1000),
@@ -989,6 +1096,7 @@ app.post('/api/generate-video', authenticate, upload.array('files', 5), async (r
               video_url: result.videoUrl,
               progress: '',
               error_message: null,
+              account_info: jimengSessionService.formatAccountInfo(account),
             });
             console.log('[生成任务] 数据库记录已更新，status = done');
           } catch (dbError) {
@@ -1426,10 +1534,9 @@ app.post('/api/tasks/:id/generate', authenticate, async (req, res) => {
       return res.status(404).json({ error: '任务不存在' });
     }
 
-    const resolvedSession = jimengSessionService.resolveEffectiveSession(req.user.id);
-    const sessionId = resolvedSession.sessionId;
+    const resolvedSessions = jimengSessionService.resolveEffectiveSessions(req.user.id);
 
-    if (!sessionId) {
+    if (!resolvedSessions.sessionId || resolvedSessions.accounts.length === 0) {
       return res.status(400).json({ error: getMissingSessionErrorMessage() });
     }
 
@@ -1466,7 +1573,7 @@ app.post('/api/tasks/:id/generate', authenticate, async (req, res) => {
       });
 
       await batchService.startBatch(batchId, {
-        sessionId,
+        accounts: resolvedSessions.accounts,
         onProgress: (data) => {
           console.log('[row-batch] 进度更新:', data);
         },
@@ -1536,12 +1643,24 @@ app.post('/api/tasks/:id/generate', authenticate, async (req, res) => {
       },
     });
 
-    generateSeedanceVideoCore({
+    const baseAccounts = resolvedSessions.accounts;
+    const rotatedAccounts = rotateAccounts(baseAccounts, req.user.id);
+    runWithSessionAccounts(rotatedAccounts, async (account, index) => {
+      if (index > 0) {
+        const switchMessage = `当前账号不可用，切换到下一个账号：${account.name || `账号${index + 1}`}`;
+        try {
+          taskService.updateTask(task.id, { progress: switchMessage });
+        } catch (err) {
+          console.error('[任务生成] 保存切换进度失败:', err.message);
+        }
+      }
+
+      return generateSeedanceVideoCore({
       prompt: task.prompt,
       ratio: settings.ratio || '16:9',
       duration: parseInt(settings.duration) || 5,
       files,
-      sessionId,
+      sessionId: account.sessionId,
       model: settings.model || 'seedance-2.0-fast',
       onProgress: async (progress) => {
         console.log(`[task ${task.id}] 进度：${progress}`);
@@ -1556,6 +1675,7 @@ app.post('/api/tasks/:id/generate', authenticate, async (req, res) => {
           taskService.updateTask(task.id, {
             submit_id: submitId,
             submitted_at: new Date().toISOString(),
+            account_info: jimengSessionService.formatAccountInfo(account),
           });
         } catch (err) {
           console.error('[任务生成] 保存 submitId 失败:', err.message);
@@ -1566,6 +1686,7 @@ app.post('/api/tasks/:id/generate', authenticate, async (req, res) => {
           taskService.updateTask(task.id, {
             history_id: historyId,
             status: 'generating',
+            account_info: jimengSessionService.formatAccountInfo(account),
           });
         } catch (err) {
           console.error('[任务生成] 保存 historyId 失败:', err.message);
@@ -1585,8 +1706,10 @@ app.post('/api/tasks/:id/generate', authenticate, async (req, res) => {
           console.error('[任务生成] 保存 videoUrl 失败:', err.message);
         }
       },
+    });
     })
-      .then((result) => {
+      .then(({ result, account }) => {
+        advanceAccountCursor(baseAccounts, req.user.id, account);
         taskService.updateTaskStatus(task.id, 'done', {
           submit_id: result.submitId || null,
           history_id: result.historyId || null,
@@ -1594,6 +1717,7 @@ app.post('/api/tasks/:id/generate', authenticate, async (req, res) => {
           video_url: result.videoUrl,
           progress: '',
           error_message: null,
+          account_info: jimengSessionService.formatAccountInfo(account),
         });
         console.log(`[task ${task.id}] 视频生成成功：${result.videoUrl}`);
       })
@@ -1868,8 +1992,8 @@ app.post('/api/batch/generate', authenticate, async (req, res) => {
       });
     }
 
-    const resolvedSession = jimengSessionService.resolveEffectiveSession(req.user.id);
-    if (!resolvedSession.sessionId) {
+    const resolvedSessions = jimengSessionService.resolveEffectiveSessions(req.user.id);
+    if (!resolvedSessions.sessionId || resolvedSessions.accounts.length === 0) {
       return res.status(400).json({ success: false, error: getMissingSessionErrorMessage() });
     }
 
@@ -1886,7 +2010,7 @@ app.post('/api/batch/generate', authenticate, async (req, res) => {
     });
 
     await batchService.startBatch(batchId, {
-      sessionId: resolvedSession.sessionId,
+      accounts: resolvedSessions.accounts,
       onProgress: (data) => {
         console.log('[batch] 进度更新:', data);
       },
@@ -2010,7 +2134,7 @@ app.put('/api/settings', (req, res) => {
 app.get('/api/settings/session-accounts', authenticate, (req, res) => {
   try {
     const accounts = jimengSessionService.listUserAccounts(req.user.id);
-    const effective = jimengSessionService.resolveEffectiveSession(req.user.id);
+    const effective = jimengSessionService.resolveEffectiveSessions(req.user.id);
     res.json({ success: true, data: { accounts, effective } });
   } catch (error) {
     res.status(500).json({ error: error.message });

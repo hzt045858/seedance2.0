@@ -3,7 +3,7 @@
 > 基于字节跳动即梦平台 Seedance 2.0 模型的 AI 视频生成 Web 应用
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
-![Version](https://img.shields.io/badge/version-v0.0.4-green.svg)
+![Version](https://img.shields.io/badge/version-v0.0.5-green.svg)
 ![Node](https://img.shields.io/badge/node-%3E%3D18-brightgreen.svg)
 ![React](https://img.shields.io/badge/React-19-61dafb.svg)
 ![Docker](https://img.shields.io/badge/Docker-supported-2496ED.svg)
@@ -16,7 +16,7 @@ Seedance 2.0 Web 是一款面向内容创作者、设计师、营销人员的 AI
 
 后端直接对接即梦 API，无需依赖 jimeng-free-api 等中间代理服务，架构简洁、部署方便，支持 Docker 一键部署。
 
-**最新功能（v0.0.4）：**
+**最新功能（v0.0.5）：**
 - 用户认证系统：支持邮箱注册、登录、密码修改
 - 左侧菜单导航：响应式设计，支持移动端
 - 管理员后台：用户管理、积分管理、系统统计
@@ -24,6 +24,9 @@ Seedance 2.0 Web 是一款面向内容创作者、设计师、营销人员的 AI
 - 批量生成：支持多任务并发、定时调度
 - 下载管理：批量下载、历史记录、文件夹管理
 - Playwright 浏览器代理：自动绕过即梦 shark 反爬机制，通过 bdms SDK 注入 `a_bogus` 签名
+- 多即梦账号轮询：支持单任务与批量任务按账号顺序轮询提交
+- 账号隔离提交上下文：按 SessionID 隔离浏览器会话、Cookie、`webId`、`userId`
+- 提交链路可观测性增强：新增“平台拒绝提交 / 提交成功 historyId”日志，便于定位风控与 fallback
 
 
 
@@ -50,6 +53,9 @@ Seedance 2.0 Web 是一款面向内容创作者、设计师、营销人员的 AI
 - 左侧菜单导航：桌面端可展开收起，移动端抽屉式响应式
 - 管理员后台：用户管理、积分充值、状态控制、系统统计
 - 批量生成管理：支持多任务并发、定时调度、进度追踪
+- 多账号轮询提交：单任务与批量任务共用同一套账号选择与 fallback 策略
+- 账号隔离浏览器上下文：每个 SessionID 独立维护浏览器会话、登录 Cookie 与请求身份
+- 提交结果可观测：可区分“绑定账号”“平台拒绝提交”“真正提交成功账号(historyId)”
 - 下载管理系统：批量下载、历史记录、文件夹管理
 
 ## 功能清单
@@ -79,6 +85,9 @@ Seedance 2.0 Web 是一款面向内容创作者、设计师、营销人员的 AI
 | 下载管理 | 批量下载 | P1 | 一键下载多个视频 |
 | 下载管理 | 打开文件夹 | P1 | 下载完成后打开文件夹 |
 | 系统设置 | SessionID 配置 | P0 | 支持环境变量和界面配置 |
+| 系统设置 | 多账号轮询 | P0 | 支持多个即梦账号按顺序轮询与失败 fallback |
+| 系统设置 | 账号隔离提交上下文 | P0 | 按 SessionID 隔离浏览器会话、Cookie、`webId`、`userId` |
+| 系统设置 | 提交日志观测 | P1 | 可区分平台拒绝、提交成功、historyId 等关键信息 |
 | 系统设置 | 响应式布局 | P0 | 桌面端左右分栏，移动端自适应 |
 | 系统设置 | Docker 部署 | P1 | 多阶段构建，docker compose 一键启动 |
 
@@ -155,6 +164,14 @@ npm run dev:server   # 仅启动 Express 后端 (:3001)
 | `PORT` | Express 后端端口 | `3001` |
 
 **SessionID 优先级**：请求体中的 `sessionId` > `.env` 中的 `VITE_DEFAULT_SESSION_ID`
+
+**当前多账号解析优先级**：`user_default` > `legacy_global` > `env_default` > `none`
+
+**多账号轮询说明**：
+- 已启用账号会按顺序轮询，单任务与批量任务共用同一套轮询策略
+- 某个账号提交失败时，会自动 fallback 到下一个可用账号
+- 浏览器代理提交阶段会按 `SessionID` 隔离 Cookie、`webId`、`userId`，避免不同账号共用提交上下文
+- 日志中“绑定账号”表示本次尝试使用的账号；只有出现 `提交成功 session ... historyId ...` 才表示平台真正接单成功
 
 ### 使用示例
 
@@ -460,6 +477,21 @@ docker compose down
 
 </details>
 
+<details>
+<summary>日志显示轮询到了账号 B，但即梦平台最终是账号 A 生成，是什么原因？</summary>
+
+通常不是轮询失效，而是账号 B 在提交阶段被平台拒绝了，随后系统自动 fallback 到账号 A。
+
+请优先查看后端日志中的这几类信息：
+
+- `本次生成绑定账号 session: ...`：本次尝试使用哪个账号提交
+- `提交被平台拒绝 session: ..., ret=..., errmsg=...`：该账号已发起提交，但被即梦平台拒绝
+- `提交成功 session: ..., historyId: ...`：这个账号才是平台真正接单成功的账号
+
+如果出现 `ret=4010`、`需要安全确认，请刷新页面重试`，通常表示该账号被即梦平台风控或要求额外安全确认，不属于程序内的账号串用问题。
+
+</details>
+
 ## 技术交流群
 
 欢迎加入技术交流群，分享使用心得和创作成果：
@@ -479,6 +511,16 @@ docker compose down
 
 ![微信支付](https://mypicture-1258720957.cos.ap-nanjing.myqcloud.com/Obsidian/image-20250914152855543.png)
 
+## 功能模版版本修订
+
+| 模版版本 | 日期 | 修订说明 |
+|------|------|------|
+| v0.0.5 | 2026-03-31 | 新增多即梦账号轮询、失败 fallback、按 SessionID 隔离浏览器提交上下文；补充“平台拒绝提交 / 提交成功 historyId”日志说明与排障文档 |
+| v0.0.4 | 2026-03-23 | 新增用户认证系统、左侧菜单导航、管理员后台；支持邮箱注册登录、积分管理、每日签到 |
+| v0.0.3 | 2026-03-22 | 新增批量生成、下载管理功能；支持多任务并发、定时调度、进度追踪 |
+| v0.0.2 | 2026-02-21 | 修复 shark not pass 反爬拦截：引入 Playwright 无头浏览器代理，通过 bdms SDK 自动注入 `a_bogus` 签名 |
+| v0.0.1 | 2025-02-14 | 初始版本，支持 Seedance 2.0 / Fast 双模型视频生成 |
+
 ## 版本历史
 
 | 版本 | 日期 | 说明 |
@@ -487,6 +529,7 @@ docker compose down
 | v0.0.2 | 2026-02-21 | 修复 shark not pass 反爬拦截：引入 Playwright 无头浏览器代理，通过 bdms SDK 自动注入 `a_bogus` 签名 |
 | v0.0.3 | 2026-03-22 | 新增批量生成、下载管理功能；支持多任务并发、定时调度、进度追踪 |
 | v0.0.4 | 2026-03-23 | 新增用户认证系统、左侧菜单导航、管理员后台；支持邮箱注册登录、积分管理、每日签到 |
+| v0.0.5 | 2026-03-31 | 新增多即梦账号轮询与失败 fallback；按 SessionID 隔离浏览器会话、Cookie、`webId`、`userId`；补充提交链路可观测日志与排障说明 |
 
 ## License
 

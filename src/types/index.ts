@@ -135,6 +135,8 @@ export interface JimengSessionAccount {
   name: string;
   sessionId: string;
   isDefault: boolean;
+  isEnabled: boolean;
+  priority: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -142,6 +144,8 @@ export interface JimengSessionAccount {
 export interface JimengSessionAccountInput {
   name?: string;
   sessionId: string;
+  isEnabled?: boolean;
+  priority?: number;
 }
 
 export type EffectiveSessionSource = 'user_default' | 'legacy_global' | 'env_default' | 'none';
@@ -150,6 +154,8 @@ export interface EffectiveSessionResolution {
   source: EffectiveSessionSource;
   sessionId: string;
   account: JimengSessionAccount | null;
+  accounts: JimengSessionAccount[];
+  defaultAccount: JimengSessionAccount | null;
 }
 
 /**

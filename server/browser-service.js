@@ -2,6 +2,8 @@ import { chromium } from 'playwright-core';
 
 const SESSION_IDLE_TIMEOUT = 10 * 60 * 1000; // 10 minutes
 const BDMS_READY_TIMEOUT = 30000; // 30 seconds
+const PAGE_GOTO_TIMEOUT = 60000; // 60 seconds
+const PAGE_GOTO_MAX_RETRIES = 2;
 
 const BLOCKED_RESOURCE_TYPES = ['image', 'font', 'stylesheet', 'media'];
 const SCRIPT_WHITELIST_DOMAINS = [
@@ -10,6 +12,20 @@ const SCRIPT_WHITELIST_DOMAINS = [
   'jianying.com',
   'byteimg.com',
 ];
+
+function buildSessionCookies(sessionId, webId, userId) {
+  return [
+    { name: '_tea_web_id', value: String(webId), domain: '.jianying.com', path: '/' },
+    { name: 'is_staff_user', value: 'false', domain: '.jianying.com', path: '/' },
+    { name: 'store-region', value: 'cn-gd', domain: '.jianying.com', path: '/' },
+    { name: 'store-region-src', value: 'uid', domain: '.jianying.com', path: '/' },
+    { name: 'uid_tt', value: String(userId), domain: '.jianying.com', path: '/' },
+    { name: 'uid_tt_ss', value: String(userId), domain: '.jianying.com', path: '/' },
+    { name: 'sid_tt', value: sessionId, domain: '.jianying.com', path: '/' },
+    { name: 'sessionid', value: sessionId, domain: '.jianying.com', path: '/' },
+    { name: 'sessionid_ss', value: sessionId, domain: '.jianying.com', path: '/' },
+  ];
+}
 
 class BrowserService {
   constructor() {
@@ -36,17 +52,42 @@ class BrowserService {
     return this.browser;
   }
 
+  async _refreshSessionCookies(session, sessionId, webId, userId, reason = 'refresh') {
+    const cookies = buildSessionCookies(sessionId, webId, userId);
+    const cookieNames = new Set(cookies.map((cookie) => cookie.name));
+    const existingCookies = await session.context.cookies('https://jimeng.jianying.com');
+    const cookiesToClear = existingCookies.filter((cookie) => cookieNames.has(cookie.name));
+
+    if (cookiesToClear.length > 0) {
+      await session.context.clearCookies({
+        domain: /(^|\.)jianying\.com$/,
+        name: new RegExp(`^(${[...cookieNames].join('|')})$`),
+      });
+    }
+
+    await session.context.addCookies(cookies);
+    session.webId = String(webId);
+    session.userId = String(userId);
+    session.boundSessionId = sessionId;
+    console.log(`[browser] 已${reason === 'reuse' ? '复用并重置' : '初始化'}账号上下文 (session: ${sessionId.substring(0, 8)}...)`);
+  }
+
+  _touchSession(sessionId, session) {
+    session.lastUsed = Date.now();
+    if (session.idleTimer) {
+      clearTimeout(session.idleTimer);
+    }
+    session.idleTimer = setTimeout(
+      () => this.closeSession(sessionId),
+      SESSION_IDLE_TIMEOUT
+    );
+  }
+
   async getSession(sessionId, webId, userId) {
     const existing = this.sessions.get(sessionId);
     if (existing) {
-      existing.lastUsed = Date.now();
-      if (existing.idleTimer) {
-        clearTimeout(existing.idleTimer);
-      }
-      existing.idleTimer = setTimeout(
-        () => this.closeSession(sessionId),
-        SESSION_IDLE_TIMEOUT
-      );
+      await this._refreshSessionCookies(existing, sessionId, webId, userId, 'reuse');
+      this._touchSession(sessionId, existing);
       return existing;
     }
 
@@ -55,18 +96,6 @@ class BrowserService {
       userAgent:
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36',
     });
-
-    // Inject cookies
-    const cookies = [
-      { name: '_tea_web_id', value: String(webId), domain: '.jianying.com', path: '/' },
-      { name: 'is_staff_user', value: 'false', domain: '.jianying.com', path: '/' },
-      { name: 'store-region', value: 'cn-gd', domain: '.jianying.com', path: '/' },
-      { name: 'uid_tt', value: String(userId), domain: '.jianying.com', path: '/' },
-      { name: 'sid_tt', value: sessionId, domain: '.jianying.com', path: '/' },
-      { name: 'sessionid', value: sessionId, domain: '.jianying.com', path: '/' },
-      { name: 'sessionid_ss', value: sessionId, domain: '.jianying.com', path: '/' },
-    ];
-    await context.addCookies(cookies);
 
     // Block non-essential resources
     await context.route('**/*', (route) => {
@@ -90,11 +119,45 @@ class BrowserService {
 
     const page = await context.newPage();
 
+    const session = {
+      context,
+      page,
+      lastUsed: Date.now(),
+      idleTimer: null,
+      webId: String(webId),
+      userId: String(userId),
+      boundSessionId: sessionId,
+    };
+
+    await this._refreshSessionCookies(session, sessionId, webId, userId, 'create');
+
     console.log(`[browser] 正在导航到 jimeng.jianying.com (session: ${sessionId.substring(0, 8)}...)`);
-    await page.goto('https://jimeng.jianying.com', {
-      waitUntil: 'domcontentloaded',
-      timeout: 30000,
-    });
+
+    let gotoError = null;
+    for (let attempt = 0; attempt <= PAGE_GOTO_MAX_RETRIES; attempt += 1) {
+      try {
+        if (attempt > 0) {
+          console.log(`[browser] 重试导航 (第${attempt}次)...`);
+        }
+        await page.goto('https://jimeng.jianying.com', {
+          waitUntil: 'domcontentloaded',
+          timeout: PAGE_GOTO_TIMEOUT,
+        });
+        gotoError = null;
+        break;
+      } catch (err) {
+        gotoError = err;
+        console.warn(`[browser] 导航失败 (第${attempt + 1}次): ${err.message}`);
+        if (attempt < PAGE_GOTO_MAX_RETRIES) {
+          await new Promise((r) => setTimeout(r, 2000 * (attempt + 1)));
+        }
+      }
+    }
+
+    if (gotoError) {
+      try { await context.close(); } catch { /* ignore */ }
+      throw gotoError;
+    }
 
     // Wait for bdms SDK to load
     try {
@@ -113,15 +176,7 @@ class BrowserService {
       console.warn('[browser] bdms SDK 等待超时，继续尝试...');
     }
 
-    const session = {
-      context,
-      page,
-      lastUsed: Date.now(),
-      idleTimer: setTimeout(
-        () => this.closeSession(sessionId),
-        SESSION_IDLE_TIMEOUT
-      ),
-    };
+    this._touchSession(sessionId, session);
 
     this.sessions.set(sessionId, session);
     console.log(`[browser] 会话已创建 (session: ${sessionId.substring(0, 8)}...)`);
@@ -150,6 +205,7 @@ class BrowserService {
     const session = await this.getSession(sessionId, webId, userId);
     const { method = 'GET', headers = {}, body } = options;
 
+    console.log(`[browser] 当前浏览器上下文已绑定账号 session: ${sessionId.substring(0, 8)}...`);
     console.log(`[browser] 通过浏览器代理请求: ${method} ${url.substring(0, 80)}...`);
 
     const result = await session.page.evaluate(

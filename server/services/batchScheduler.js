@@ -9,6 +9,7 @@ import * as settingsService from './settingsService.js';
 import * as taskService from './taskService.js';
 import * as projectService from './projectService.js';
 import { generateSeedanceVideo } from './videoGenerator.js';
+import * as jimengSessionService from './jimengSessionService.js';
 import * as videoDownloader from './videoDownloader.js';
 
 // ============================================================
@@ -133,16 +134,18 @@ function buildBatchDetail(batch, runtime = null, userId = null, isAdmin = false)
 
 class BatchScheduler {
   constructor(options = {}) {
-    this.maxConcurrent = options.maxConcurrent || 5;
+    this.accounts = Array.isArray(options.accounts) ? [...options.accounts] : [];
+    this.maxConcurrent = Math.max(1, Math.min(options.maxConcurrent || 5, this.accounts.length || options.maxConcurrent || 5));
     this.minInterval = options.minInterval || 30000;
     this.maxInterval = options.maxInterval || 50000;
     this.currentRunning = 0;
     this.queue = [];
     this.batchId = null;
     this.status = 'pending';
-    this.sessionId = options.sessionId || '';
     this.taskSnapshots = new Map();
     this.activeTaskGenerators = new Map(); // 存储正在生成的任务控制器
+    this.accountCursor = 0;
+    this.accountBusySet = new Set();
 
     // 回调函数
     this.onProgress = options.onProgress || (() => {});
@@ -191,12 +194,18 @@ class BatchScheduler {
       this.currentRunning < this.maxConcurrent &&
       this.queue.length > 0
     ) {
+      const account = this._acquireNextAccount();
+      if (!account) {
+        break;
+      }
+
       const taskId = this.queue.shift();
       this.currentRunning += 1;
 
       await taskService.updateTaskStatus(taskId, 'generating', {
         progress: '正在准备素材...',
         error_message: null,
+        account_info: jimengSessionService.formatAccountInfo(account),
       });
       this._mergeTaskSnapshot(taskId, {
         status: 'generating',
@@ -206,12 +215,12 @@ class BatchScheduler {
       this._persistBatchCounts();
       this._updateBatchRuntime({ currentRunning: this.currentRunning, queueLength: this.queue.length });
 
-      // 第一个任务不等待，后续任务随机间隔
       if (this.currentRunning > 1) {
         await this._sleep(this._randomDelay());
       }
 
-      this._executeTask(taskId).finally(() => {
+      this._executeTask(taskId, account).finally(() => {
+        this._releaseAccount(account);
         this.currentRunning -= 1;
         this._persistBatchCounts();
         this._updateBatchRuntime({ currentRunning: this.currentRunning, queueLength: this.queue.length });
@@ -223,7 +232,70 @@ class BatchScheduler {
     this._finalizeIfIdle();
   }
 
-  async _executeTask(taskId) {
+  _acquireNextAccount() {
+    if (this.accounts.length === 0) {
+      return null;
+    }
+
+    for (let offset = 0; offset < this.accounts.length; offset += 1) {
+      const index = (this.accountCursor + offset) % this.accounts.length;
+      const account = this.accounts[index];
+      if (this.accountBusySet.has(account.id)) {
+        continue;
+      }
+      this.accountBusySet.add(account.id);
+      this.accountCursor = (index + 1) % this.accounts.length;
+      console.log(`[batch][account] 轮询选择账号: ${account.name || `账号${index + 1}`} (${index + 1}/${this.accounts.length})`);
+      console.log(`[batch][account] 已预留下次轮询起点: ${this.accounts[this.accountCursor].name || `账号${this.accountCursor + 1}`} (${this.accountCursor + 1}/${this.accounts.length})`);
+      return account;
+    }
+
+    return null;
+  }
+
+  _advanceAccountCursor(account) {
+    if (!account || this.accounts.length <= 1) {
+      return;
+    }
+
+    const currentIndex = this.accounts.findIndex((item) => item.id === account.id);
+    if (currentIndex === -1) {
+      return;
+    }
+
+    this.accountCursor = (currentIndex + 1) % this.accounts.length;
+    console.log(`[batch][account] 本次成功账号: ${account.name || `账号${currentIndex + 1}`} (${currentIndex + 1}/${this.accounts.length})`);
+    console.log(`[batch][account] 下次轮询起点: ${this.accounts[this.accountCursor].name || `账号${this.accountCursor + 1}`} (${this.accountCursor + 1}/${this.accounts.length})`);
+  }
+
+  _getAccountLabel(account, index) {
+    return account?.name || `账号${index + 1}`;
+  }
+
+  _releaseAccount(account) {
+    if (!account) {
+      return;
+    }
+    this.accountBusySet.delete(account.id);
+  }
+
+  _getOrderedAccounts(preferredAccount = null) {
+    if (!preferredAccount) {
+      return [...this.accounts];
+    }
+
+    const preferredIndex = this.accounts.findIndex((account) => account.id === preferredAccount.id);
+    if (preferredIndex === -1) {
+      return [...this.accounts];
+    }
+
+    return [
+      ...this.accounts.slice(preferredIndex),
+      ...this.accounts.slice(0, preferredIndex),
+    ];
+  }
+
+  async _executeTask(taskId, preferredAccount = null) {
     let task = null;
     let isCancelled = false;
 
@@ -241,7 +313,7 @@ class BatchScheduler {
         return updatedTask?.status === 'cancelled';
       };
 
-      const result = await this._generateVideo(task, checkCancelled);
+      const result = await this._generateVideo(task, preferredAccount, checkCancelled);
 
       // 再次检查是否被取消
       if (checkCancelled()) {
@@ -256,6 +328,7 @@ class BatchScheduler {
         video_url: result.videoUrl,
         progress: '视频生成完成',
         error_message: null,
+        account_info: result.accountInfo || null,
       });
 
       this._mergeTaskSnapshot(taskId, {
@@ -309,13 +382,13 @@ class BatchScheduler {
     }
   }
 
-  async _generateVideo(task, checkCancelled) {
+  async _generateVideo(task, preferredAccount, checkCancelled) {
     const assets = taskService.getTaskAssets(task.id);
     const imageAssets = assets.filter(asset => asset.asset_type === 'image');
     const settings = settingsService.getAllSettings();
 
-    if (!this.sessionId) {
-      throw new Error('未配置可用的 SessionID，请在设置页添加并设为默认账号');
+    if (this.accounts.length === 0) {
+      throw new Error('未配置可用的 SessionID，请在设置页添加并启用账号');
     }
 
     const files = [];
@@ -331,7 +404,6 @@ class BatchScheduler {
         console.error(`[batch] 读取图片文件失败：${asset.file_path}`, error.message);
       }
 
-      // 检查是否被取消
       if (checkCancelled && checkCancelled()) {
         throw new Error('任务已取消');
       }
@@ -341,42 +413,79 @@ class BatchScheduler {
       throw new Error('任务没有可用的图片素材');
     }
 
-    return generateSeedanceVideo({
-      prompt: task.prompt,
-      ratio: settings.ratio || '16:9',
-      duration: parseInt(settings.duration, 10) || 5,
-      files,
-      sessionId: this.sessionId,
-      model: settings.model || 'seedance-2.0-fast',
-      onProgress: async (progress) => {
-        await taskService.updateTask(task.id, { progress });
-        this._mergeTaskSnapshot(task.id, { progress });
-        this._notifyProgress(task.id, progress);
-      },
-      onSubmitId: async (submitId) => {
-        const submittedAt = new Date().toISOString();
-        await taskService.updateTask(task.id, {
-          submit_id: submitId,
-          submitted_at: submittedAt,
+    let lastError = null;
+    const orderedAccounts = this._getOrderedAccounts(preferredAccount);
+    for (let index = 0; index < orderedAccounts.length; index += 1) {
+      const account = orderedAccounts[index];
+      try {
+        if (index > 0) {
+          const switchMessage = `当前账号不可用，切换到下一个账号：${account.name || `账号${index + 1}`}`;
+          await taskService.updateTask(task.id, {
+            progress: switchMessage,
+            account_info: jimengSessionService.formatAccountInfo(account),
+          });
+          this._mergeTaskSnapshot(task.id, { progress: switchMessage });
+          this._notifyProgress(task.id, switchMessage);
+        }
+
+        const result = await generateSeedanceVideo({
+          prompt: task.prompt,
+          ratio: settings.ratio || '16:9',
+          duration: parseInt(settings.duration, 10) || 5,
+          files,
+          sessionId: account.sessionId,
+          model: settings.model || 'seedance-2.0-fast',
+          onProgress: async (progress) => {
+            await taskService.updateTask(task.id, {
+              progress,
+              account_info: jimengSessionService.formatAccountInfo(account),
+            });
+            this._mergeTaskSnapshot(task.id, { progress });
+            this._notifyProgress(task.id, progress);
+          },
+          onSubmitId: async (submitId) => {
+            const submittedAt = new Date().toISOString();
+            await taskService.updateTask(task.id, {
+              submit_id: submitId,
+              submitted_at: submittedAt,
+              account_info: jimengSessionService.formatAccountInfo(account),
+            });
+            this._mergeTaskSnapshot(task.id, { submitId });
+          },
+          onHistoryId: async (historyId) => {
+            await taskService.updateTask(task.id, {
+              history_id: historyId,
+              status: 'generating',
+              account_info: jimengSessionService.formatAccountInfo(account),
+            });
+            this._mergeTaskSnapshot(task.id, { historyId });
+          },
+          onItemId: async (itemId) => {
+            await taskService.updateTask(task.id, { item_id: itemId });
+            this._mergeTaskSnapshot(task.id, { itemId });
+          },
+          onVideoReady: async (videoUrl) => {
+            await taskService.updateTask(task.id, { video_url: videoUrl });
+            this._mergeTaskSnapshot(task.id, { videoUrl });
+          },
         });
-        this._mergeTaskSnapshot(task.id, { submitId });
-      },
-      onHistoryId: async (historyId) => {
-        await taskService.updateTask(task.id, {
-          history_id: historyId,
-          status: 'generating',
-        });
-        this._mergeTaskSnapshot(task.id, { historyId });
-      },
-      onItemId: async (itemId) => {
-        await taskService.updateTask(task.id, { item_id: itemId });
-        this._mergeTaskSnapshot(task.id, { itemId });
-      },
-      onVideoReady: async (videoUrl) => {
-        await taskService.updateTask(task.id, { video_url: videoUrl });
-        this._mergeTaskSnapshot(task.id, { videoUrl });
-      },
-    });
+
+        this._advanceAccountCursor(account);
+        return {
+          ...result,
+          accountInfo: jimengSessionService.formatAccountInfo(account),
+        };
+      } catch (error) {
+        lastError = error;
+        const message = String(error?.message || error || '').toLowerCase();
+        const retryable = ['session', '401', '403', '积分不足', '未登录', '过期', 'cookie', '账号', 'timeout', '超时', 'navigate', 'net::', 'err_connection', 'page.goto', 'fetch failed', 'econnrefused', 'econnreset'].some((keyword) => message.includes(keyword));
+        if (!retryable || index === orderedAccounts.length - 1) {
+          throw error;
+        }
+      }
+    }
+
+    throw lastError || new Error('生成失败');
   }
 
   async _autoDownloadVideo(taskId, videoUrl, historyId) {
@@ -713,7 +822,7 @@ export async function startBatch(batchId, options = {}) {
 
   const taskIds = parseTaskIds(batch.task_ids);
   const scheduler = new BatchScheduler({
-    maxConcurrent: batch.concurrent_count || 5,
+    maxConcurrent: Math.min(batch.concurrent_count || 5, Array.isArray(options.accounts) && options.accounts.length > 0 ? options.accounts.length : (batch.concurrent_count || 5)),
     minInterval: batch.min_interval || 30000,
     maxInterval: batch.max_interval || 50000,
     ...options,

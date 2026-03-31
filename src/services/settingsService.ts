@@ -97,18 +97,6 @@ export async function deleteSessionAccount(id: number): Promise<void> {
   }
 }
 
-export async function setDefaultSessionAccount(id: number): Promise<JimengSessionAccount> {
-  const response = await fetch(`${API_BASE}/settings/session-accounts/${id}/default`, {
-    method: 'POST',
-    headers: getAuthHeaders(),
-  });
-  const result: ApiResponse<JimengSessionAccount> = await response.json();
-  if (!result.success) {
-    throw new Error(result.error || '设置默认 SessionID 失败');
-  }
-  return result.data!;
-}
-
 export async function testJimengSessionId(
   sessionId: string
 ): Promise<{ success: boolean; message?: string; error?: string }> {
@@ -132,6 +120,5 @@ export default {
   createSessionAccount,
   updateSessionAccount,
   deleteSessionAccount,
-  setDefaultSessionAccount,
   testJimengSessionId,
 };

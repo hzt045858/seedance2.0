@@ -68,11 +68,10 @@ function shouldSkipMigration(db, file) {
     ].every((columnName) => columnNames.has(columnName));
   }
 
-  // 对于更新 email_verification_codes 表的迁移，检查列是否存在
-  if (file === '20260326_update_email_verification_codes.sql') {
-    const columns = db.prepare(`PRAGMA table_info(email_verification_codes)`).all();
+  if (file === '20260330_add_jimeng_session_account_activation.sql') {
+    const columns = db.prepare(`PRAGMA table_info(jimeng_session_accounts)`).all();
     const columnNames = new Set(columns.map((column) => column.name));
-    return ['purpose', 'code_hash', 'salt', 'attempts', 'request_ip', 'consumed_at'].every((columnName) => columnNames.has(columnName));
+    return ['is_enabled', 'priority'].every((columnName) => columnNames.has(columnName));
   }
 
   return false;
